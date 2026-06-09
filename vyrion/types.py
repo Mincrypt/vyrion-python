@@ -90,3 +90,31 @@ class VyrionConfig:
     default_goal: str = "auto"
     cache: Union[bool, Any] = False
     circuit_breaker: Optional[CircuitBreakerConfig] = None
+
+@dataclass
+class ProviderStats:
+    provider: str
+    requests: int
+    errors: int
+    total_tokens: int
+    total_cost: float
+    total_latency: int
+    avg_latency: int
+    error_rate: float
+
+@dataclass
+class AnalyticsSnapshot:
+    total_requests: int
+    total_errors: int
+    total_tokens: int
+    total_cost: float
+    providers: List[ProviderStats]
+    since: str
+
+@dataclass
+class HealthCheckResult:
+    provider: str
+    status: str  # "up" | "down" | "unknown"
+    latency: int
+    checkedAt: str
+    error: Optional[str] = None

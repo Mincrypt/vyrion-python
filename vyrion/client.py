@@ -1,14 +1,22 @@
 import asyncio
 from typing import List, Dict, Any, Union, Optional, AsyncIterator, Callable
-from .types import ChatRequest, ChatResponse, StreamChunk, Message, MessageContentPart, ProviderConfig
+from .types import ChatRequest, ChatResponse, StreamChunk, Message, MessageContentPart, ProviderConfig, AnalyticsSnapshot, HealthCheckResult
 from .router.fallback import FallbackRouter
 from .router.circuit import CircuitBreakerManager
 from .cache.memory import InMemoryCache, generate_cache_key
 from .middleware.compose import compose
+
 from .providers.openai import OpenAIProvider
 from .providers.gemini import GeminiProvider
 from .providers.anthropic import AnthropicProvider
-from .analytics.cost import estimate_cost
+from .providers.groq import GroqProvider
+from .providers.together import TogetherProvider
+from .providers.mistral import MistralProvider
+from .providers.ollama import OllamaProvider
+
+from .analytics.tracker import AnalyticsTracker
+from .analytics.health import HealthMonitor
+from .analytics.cost import estimate_cost, get_pricing, set_pricing
 
 class Vyrion:
     def __init__(self, **config):
@@ -37,8 +45,19 @@ class Vyrion:
             else:
                 self.circuit_breaker = cb_config
 
-        self.analytics = None
+        self.analytics = AnalyticsTracker()
+        self.health = HealthMonitor()
         self._register_builtins()
+
+        # Raise error if no active providers configured
+        if not self.providers:
+            raise ValueError(
+                "No active providers found. Please configure at least one provider API key.\n\n"
+                "Examples:\n"
+                "  ai = Vyrion(openai='your-openai-api-key')\n"
+                "  ai = Vyrion(groq='your-groq-api-key')\n"
+                "  ai = Vyrion(ollama={})\n"
+            )
 
         self.router = FallbackRouter(self.providers, self.analytics, self.circuit_breaker)
 
@@ -54,10 +73,50 @@ class Vyrion:
             return True
         return False
 
+    def get_providers(self) -> List[str]:
+        return list(self.providers.keys())
+
+    def get_available_providers(self) -> List[str]:
+        return [name for name, p in self.providers.items() if p.is_available()]
+
+    # ── Analytics API ─────────────────────────────────────────
+
+    def get_stats(self) -> AnalyticsSnapshot:
+        return self.analytics.get_snapshot()
+
+    def reset_stats(self) -> None:
+        self.analytics.reset()
+
+    def get_total_cost(self) -> float:
+        return self.analytics.get_snapshot().total_cost
+
+    # ── Health API ────────────────────────────────────────────
+
+    async def get_provider_health(self) -> List[HealthCheckResult]:
+        self.health.providers = list(self.providers.values())
+        return await self.health.check_all()
+
+    def start_health_monitor(self, interval_seconds: int = 300) -> None:
+        self.health.interval_seconds = interval_seconds
+        self.health.start(list(self.providers.values()))
+
+    def stop_health_monitor(self) -> None:
+        self.health.stop()
+
+    # ── Pricing API ───────────────────────────────────────────
+
+    def get_pricing(self, provider: Optional[str] = None) -> Any:
+        return get_pricing(provider)
+
+    def set_pricing(self, provider: str, model: str, pricing: dict) -> None:
+        set_pricing(provider, model, pricing)
+
+    # ── Execution API ─────────────────────────────────────────
+
     async def chat(self, request_payload: Union[dict, ChatRequest]) -> ChatResponse:
         req = self._coerce_request(request_payload)
 
-        async def core_executor(ctx):
+        async def core_executor(ctx, next_dispatch=None):
             response = await self.router.chat(ctx["request"])
             if response.cost == 0.0:
                 response.cost = estimate_cost(response.provider, response.model, response.usage)
@@ -147,11 +206,15 @@ class Vyrion:
             "openai": OpenAIProvider,
             "gemini": GeminiProvider,
             "anthropic": AnthropicProvider,
+            "groq": GroqProvider,
+            "together": TogetherProvider,
+            "mistral": MistralProvider,
+            "ollama": OllamaProvider,
         }
 
         for name, provider_class in builtins.items():
             conf_val = self.config.get(name)
-            if conf_val:
+            if conf_val is not None:
                 p_conf = {}
                 if isinstance(conf_val, str):
                     p_conf = {"api_key": conf_val, "timeout": timeout}

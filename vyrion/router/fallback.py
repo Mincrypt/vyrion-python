@@ -36,6 +36,9 @@ class FallbackRouter:
                 latency = int((time.time() - start) * 1000)
                 
                 response.latency = latency
+                if response.cost == 0.0:
+                    from ..analytics.cost import estimate_cost
+                    response.cost = estimate_cost(response.provider, response.model, response.usage)
                 if self.analytics:
                     self.analytics.record(
                         provider=provider.name,

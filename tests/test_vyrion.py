@@ -47,7 +47,7 @@ class MockProvider:
         yield StreamChunk(delta=f" stream", done=True, provider=self.name, model=self.default_model)
 
     async def health_check(self) -> dict:
-        return {}
+        return {"status": "up"}
 
 
 # ── Testing Suites ──────────────────────────────────────────
@@ -55,7 +55,7 @@ class MockProvider:
 @pytest.mark.asyncio
 async def test_simple_routing_and_failover():
     """Verify router fails over to secondary providers when primary fails."""
-    ai = Vyrion()
+    ai = Vyrion(openai="sk-test")
     
     bad_p = MockProvider("bad-provider", fails_times=1)
     good_p = MockProvider("good-provider")
@@ -78,6 +78,7 @@ async def test_simple_routing_and_failover():
 async def test_circuit_breaker_threshold_trip():
     """Verify circuit breaker trips and bypasses degraded provider after sequential errors."""
     ai = Vyrion(
+        openai="sk-test",
         circuit_breaker={"failures_threshold": 2, "cooldown_seconds": 5}
     )
     
@@ -119,6 +120,7 @@ async def test_circuit_breaker_threshold_trip():
 async def test_circuit_breaker_instant_429_trip():
     """Verify circuit breaker trips instantly on HTTP 429 rate limit exceptions."""
     ai = Vyrion(
+        openai="sk-test",
         circuit_breaker={"failures_threshold": 5, "cooldown_seconds": 5}
     )
     
@@ -150,7 +152,7 @@ async def test_circuit_breaker_instant_429_trip():
 @pytest.mark.asyncio
 async def test_chat_and_stream_caching():
     """Verify chat and stream requests are cached and play back correctly."""
-    ai = Vyrion(cache=True)
+    ai = Vyrion(openai="sk-test", cache=True)
     
     stream_provider = MockProvider("stream-provider")
     ai.register_provider(stream_provider)
@@ -187,7 +189,7 @@ async def test_chat_and_stream_caching():
 @pytest.mark.asyncio
 async def test_onion_middleware_lifecycle():
     """Verify onion middleware runs in wrapping lifecycle sequences."""
-    ai = Vyrion()
+    ai = Vyrion(openai="sk-test")
     
     mock_p = MockProvider("provider-a")
     ai.register_provider(mock_p)
@@ -236,3 +238,138 @@ async def test_multimodal_openai_unsupported_document():
 
     with pytest.raises(ValueError, match="OpenAI does not natively support 'application/pdf'"):
         prov._map_content(req.messages[0].content)
+
+
+@pytest.mark.asyncio
+async def test_analytics_stats_tracking():
+    """Verify that analytics tracker successfully logs chat requests and outputs stats snapshots."""
+    ai = Vyrion(openai="sk-test")
+    ai.register_provider(MockProvider("provider-a"))
+    ai.set_pricing("provider-a", "mock-model", {"inputPer1M": 1.0, "outputPer1M": 2.0})
+
+    # Initially stats should be empty
+    stats = ai.get_stats()
+    assert stats.total_requests == 0
+
+    # Call chat
+    res = await ai.chat({"message": "hello", "provider": "provider-a"})
+    
+    stats = ai.get_stats()
+    assert stats.total_requests == 1
+    assert stats.total_cost > 0.0
+    assert ai.get_total_cost() == stats.total_cost
+
+    p_stats = stats.providers[0]
+    assert p_stats.provider == "provider-a"
+    assert p_stats.requests == 1
+    assert p_stats.errors == 0
+
+    # Reset stats
+    ai.reset_stats()
+    assert ai.get_stats().total_requests == 0
+    assert ai.get_total_cost() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_background_health_monitor():
+    """Verify that start_health_monitor and stop_health_monitor run check loops correctly."""
+    ai = Vyrion(openai="sk-test")
+    ai.unregister_provider("openai")
+    mock_p = MockProvider("provider-b")
+    ai.register_provider(mock_p)
+
+    # Trigger single check immediately
+    healths = await ai.get_provider_health()
+    assert len(healths) == 1
+    assert healths[0].provider == "provider-b"
+    assert healths[0].status == "up"
+
+    # Start monitor background loop (interval: 1 sec for fast test)
+    ai.start_health_monitor(interval_seconds=1)
+    await asyncio.sleep(1.5)
+    
+    assert ai.health.get_status("provider-b") == "up"
+    assert len(ai.health.get_all_statuses()) == 1
+
+    ai.stop_health_monitor()
+    assert ai.health._task is None
+
+
+@pytest.mark.asyncio
+async def test_ollama_mock_requests(monkeypatch):
+    """Verify that Ollama provider correctly requests localhost:11434 endpoints."""
+    import json
+    from vyrion.providers.ollama import OllamaProvider
+    
+    # Mocking standard ClientSession.post of aiohttp
+    class MockResponse:
+        def __init__(self, status, data, is_stream=False):
+            self.status = status
+            self._data = data
+            self.is_stream = is_stream
+            
+            # For stream
+            if is_stream:
+                class MockStream:
+                    def __init__(self, lines):
+                        self.lines = lines
+                    def __aiter__(self):
+                        return self
+                    async def __anext__(self):
+                        if not self.lines:
+                            raise StopAsyncIteration
+                        return self.lines.pop(0)
+                self.content = MockStream([
+                    json.dumps({"message": {"content": "Hello"}, "done": False}).encode("utf-8"),
+                    json.dumps({"message": {"content": " world!"}, "done": True}).encode("utf-8"),
+                ])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def json(self):
+            return self._data
+
+        async def text(self):
+            return json.dumps(self._data)
+
+    class MockSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        def post(self, url, json=None, **kwargs):
+            is_stream = json.get("stream", False) if json else False
+            if is_stream:
+                return MockResponse(200, {}, is_stream=True)
+            return MockResponse(200, {
+                "message": {"content": "Mocked Ollama Response"},
+                "prompt_eval_count": 5,
+                "eval_count": 10,
+                "done": True
+            })
+        def get(self, url, **kwargs):
+            return MockResponse(200, {"status": "ok"})
+
+    monkeypatch.setattr("aiohttp.ClientSession", MockSession)
+
+    prov = OllamaProvider({"base_url": "http://localhost:11434"})
+    assert prov.is_available() is True
+
+    # Test chat
+    req = ChatRequest(message="test")
+    res = await prov.chat(req)
+    assert res.content == "Mocked Ollama Response"
+    assert res.usage.total == 15
+    assert res.cost == 0.0
+
+    # Test stream
+    chunks = []
+    async for chunk in prov.stream(req):
+        chunks.append(chunk.delta)
+    assert chunks == ["Hello", " world!"]

@@ -86,7 +86,12 @@ async def example_streaming_cache():
             yield StreamChunk(delta=" cache!", done=True, provider=self.name, model=self.default_model)
 
         async def health_check(self) -> dict:
-            return {}
+            return {
+                "provider": self.name,
+                "status": "up",
+                "latency": 5,
+                "checkedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            }
 
     mock_provider = CountingStreamProvider()
     cached_client.register_provider(mock_provider)
@@ -130,15 +135,46 @@ class MockChatProvider:
         yield StreamChunk(delta=f"Mock stream content from {self.name}", done=True, provider=self.name, model=self.default_model)
 
     async def health_check(self) -> dict:
-        return {}
+        return {
+            "provider": self.name,
+            "status": "up",
+            "latency": 5,
+            "checkedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
+
+
+async def example_analytics_and_health(ai: Vyrion):
+    print("\n-- 5. Analytics & Health Checks ---------------")
+    # Expose registered providers list
+    print(f"Registered providers: {ai.get_providers()}")
+    print(f"Available providers: {ai.get_available_providers()}")
+    
+    # Retrieve current stats snapshots
+    stats = ai.get_stats()
+    print(f"Total requests recorded: {stats.total_requests}")
+    print(f"Total USD cost: ${stats.total_cost:.6f}")
+    for ps in stats.providers:
+        print(f"  - {ps.provider}: {ps.requests} requests | Avg Latency: {ps.avg_latency}ms | Cost: ${ps.total_cost:.6f}")
+
+    # Trigger health checks
+    print("Running immediate health checks...")
+    healths = await ai.get_provider_health()
+    for h in healths:
+        icon = "[OK]" if h.status == "up" else "[FAIL]"
+        print(f"  {icon} {h.provider}: {h.status} ({h.latency}ms)")
 
 
 async def main():
-    ai = Vyrion()
+    ai = Vyrion(openai="mock-key")
+    # Configure custom pricing overrides
+    ai.set_pricing("openai", "mock-model", {"inputPer1M": 1.5, "outputPer1M": 3.0})
+    ai.set_pricing("groq", "mock-model", {"inputPer1M": 0.5, "outputPer1M": 1.0})
+    
     await example_simple_chat(ai)
     await example_streaming(ai)
     await example_circuit_breaker()
     await example_streaming_cache()
+    await example_analytics_and_health(ai)
 
 if __name__ == "__main__":
     asyncio.run(main())
